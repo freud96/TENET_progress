@@ -8,7 +8,7 @@ This document summarizes key points of Chapter 7 of [MLC-Course](https://mlc.ai/
 
 As most MLC process can be seen as transformation among tensor function, it is necessary to learn how transformations are done in both primitive tensor function described in [Chapter 2](https://mlc.ai/chapter_tensor_program/case_study.html#transformation) and high-level transformations among computational graphs.
 
-An MLC program typicallyhas an IRModule that is made of a collection of functions, the function body is composed of a set of data structured referred to as absract syntax trees(AST).  
+An MLC program typically has an IRModule that is made of a collection of functions, the function body is composed of a set of data structured referred to as absract syntax trees(AST).  
 
 We might want to modify an IRModule for optimization. Pattern matching and rewriting is an option to do so.
 Consider the following IRModule
