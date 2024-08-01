@@ -156,3 +156,55 @@ print(report3)
 | -------------- | -------------- | -------------- | --------------- | ------------ |
 | Total duration(us) | 353.32  | 304.37 | 364.41  | 312.16 |
 
+
+
+## Plan to include hooks to capture metrics during runtime
+Since the input sequence length varies, it in important to capture the metrics during runtime instead of compile time. Below shows the transform step flow.
+
+![MLC flow with hook](../imgs/MLC_hook_flow.png)
+
+In order to add the hook, we need to target TIR internal block. To do so, TVM tir has [stmt.py](https://github.com/apache/tvm/blob/main/python/tvm/tir/stmt.py) and [stmt_functor.py](https://github.com/apache/tvm/blob/main/python/tvm/tir/stmt_functor.py). 
+
+on first try, we implement 3 functions to modify the IRModule, they are namely: 
+* insert_print_statement, to get the loop variables and add the print statement.
+* apply_custom_pass, to look for functions within the IRModule to pass to insert_print function.
+
+``` python 
+def insert_print_statements(stmt):
+    def pre_order(op):
+        if isinstance(op, tir.For):
+            loop_var = op.loop_var
+            print_stmt = tir.Evaluate(
+                tvm.tir.call_extern("int32", "printf", f"Loop {loop_var.name}: %d\\n", loop_var)
+            )
+            new_body = tir.SeqStmt([print_stmt, op.body])
+            return tir.For(op.loop_var, op.min, op.extent, op.kind, new_body, op.thread_binding, op.annotations)
+        return None
+
+    def post_order(op):
+        return op
+
+    return tir.stmt_functor.ir_transform(stmt, pre_order, post_order, None)
+
+def apply_custom_pass(mod):
+    for gv in mod.functions:
+        func = mod[gv]
+        if isinstance(func, tir.PrimFunc):
+            try:
+                new_body = insert_print_statements(func.body)
+                mod[gv] = func.with_body(new_body)
+            except Exception as e:
+                print(f"Error transforming function {gv}: {e}")
+    return mod
+
+@tvm.ir.transform.module_pass(opt_level=0)
+class HookPass:
+    def __init__(self):
+        pass
+
+    def transform_module(self, mod, ctx):
+        return apply_custom_pass(mod)
+```
+
+during runtime for experiment purpose, we capture this below
+![loop print in runtime](../imgs/loop_print.PNG)
