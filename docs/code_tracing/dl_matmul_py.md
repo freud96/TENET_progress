@@ -3,7 +3,7 @@
 This document studies MLC-LLM's, pipeline.py, matmul.py of Dlight. The former is to compile the model into executable library to deploy on native hardware, the latter is written as a pass to optimize IRModule, GEMM schefule rule for GPU operators. This documents mainly has 3 parts:
 
 1. Detailing pipeline.py, when and how it is called
-2. How the IRModule, whioch block it targets.
+2. How the IRModule, which block it targets.
 3. Case study of GPT-2
 
 ## Objective
