@@ -214,5 +214,3 @@ The main function for compiling the model perform the following steps below:
     ```
 
   N.B: we do not cover the detail of each functions in this document  
-
-## Extracting the workload dimensions during runtime
