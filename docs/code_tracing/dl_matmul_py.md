@@ -214,3 +214,210 @@ The main function for compiling the model perform the following steps below:
     ```
 
   N.B: we do not cover the detail of each functions in this document  
+
+
+## Code Tracing of the GPU schedule rule
+
+In phase 4 of the compilation pipeline, MLC LLM calls on TVM's dlight to schedule the module for GPU, matrix multiplication, matrix-vector multiplication, reduction etc. 
+
+Our main focus will be on matrix multiplication schedule rule; In the python script, there are 3 classes that can apply schedule rule depending on the input/output data type, for instance, rule for float16 and rule for int8 tensor cores
+
+The general GPU schedule rule class is as follow:
+
+```python 
+class Matmul(GPUScheduleRule):
+    """The schedule rule for matmul-like computation"""
+
+    @dataclass
+    class Config:
+        block_size_x: int = 8
+        block_size_y: int = 8
+        vthread_x: int = 1
+        vthread_y: int = 1
+        micro_size_x: int = 4
+        micro_size_y: int = 4
+        micro_size_k: int = 8
+        vector_size: int = 1
+        unroll: int = 256  # 0 means no unroll
+        use_shared: bool = True
+        storage_align: bool = False
+        inner_x: bool = False
+
+    def get_configs(self, target: Target) -> Config:
+        """Get the schedule config for the target"""
+        if target.kind.name == "cuda" or target.kind.name == "rocm":
+            return Matmul.Config(
+                block_size_x=8,
+                block_size_y=16,
+                vthread_x=1,
+                vthread_y=1,
+                micro_size_x=4,
+                micro_size_y=4,
+                micro_size_k=16,
+                vector_size=2,
+                unroll=256,
+                use_shared=True,
+                storage_align=True,
+                inner_x=False,
+            )
+        elif target.kind.name == "opencl" and "android" in str(target.host):
+            return Matmul.Config(
+                block_size_x=8,
+                block_size_y=16,
+                vthread_x=1,
+                vthread_y=1,
+                micro_size_x=8,
+                micro_size_y=2,
+                micro_size_k=16,
+                vector_size=8,
+                unroll=64,
+                use_shared=False,
+                storage_align=False,
+                inner_x=True,
+            )
+        else:
+            return Matmul.Config()
+
+    def apply(  # pylint: disable=too-many-locals,missing-docstring
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        _: bool,
+    ) -> Optional[tir.Schedule]:
+        if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
+            return None
+        sch = tir.Schedule(func)
+        root_block = analysis.get_root_block(sch)
+        blocks = sch.get_child_blocks(root_block)
+
+        reduction_blocks = get_reduction_blocks(sch, blocks)
+        if reduction_blocks is None:
+            return None
+
+        main_block = reduction_blocks[0]
+        block_stmt = sch.get(main_block)
+        index_maps = get_index_map(block_stmt)
+        if index_maps is None:
+            return None
+        matmul_index_map, a_index_map, b_index_map, c_index_map = index_maps
+
+        # Step 0. Normalize generic matmul to C[S, I, J] += A[S, I, K] * B[S, J, K]
+        block = sch.reindex(main_block, ("read", 0))
+        sch.transform_layout(block, ("write", 0), a_index_map)
+        block = sch.reindex(main_block, ("read", 1))
+        sch.transform_layout(block, ("write", 0), b_index_map)
+        block = sch.reindex(main_block, ("write", 0))
+        sch.transform_layout(block, ("read", 0), c_index_map)
+        sch.transform_block_layout(main_block, matmul_index_map)
+
+        # Step 1. Check Tensor Core support
+        # Tensorization config:
+        # If any value of I, J, K is fixed and less than this threshold,
+        # tensorization rule will not be applied.
+        minimal_tensorize_threshold = 64
+        block_stmt = sch.get(main_block)
+        if target.kind.name == "cuda" and check_sm_version(target.arch) >= 70:
+            apply_tensorization: bool = True
+            # the batch dimension is not taken into consideration.
+            for item_var in block_stmt.iter_vars[1:]:
+                extent = item_var.dom.extent
+                if isinstance(extent, tir.expr.IntImm):
+                    if extent.value <= minimal_tensorize_threshold:
+                        apply_tensorization = False
+            if apply_tensorization:
+                # Analyze read/write buffers and choose correct tensorizer: int8 or fp16.
+                in_dtype, out_dtype = get_in_out_dtypes(block_stmt)
+                tensorize_sch = None
+                if in_dtype == "int8" and out_dtype == "int32":
+                    tensorize_sch = MatmulInt8Tensorization().apply(func, target, _)
+                elif in_dtype == "float16" and out_dtype in ["float16", "float32"]:
+                    tensorize_sch = MatmulTensorization().apply(func, target, _)
+                if tensorize_sch is not None:
+                    return tensorize_sch
+
+        # Step 2. Get schedule config.
+        config = self.get_configs(target)
+
+        # Step 3. Schedule matmul
+        y_kernel_size = config.vthread_y * config.block_size_y * config.micro_size_y
+        x_kernel_size = config.vthread_x * config.block_size_x * config.micro_size_x
+        if config.inner_x:
+            sch.pad_einsum(
+                main_block,
+                [1, y_kernel_size, x_kernel_size, config.micro_size_k],
+            )
+            batch, y, x, k = sch.get_loops(main_block)
+        else:
+            sch.pad_einsum(
+                main_block,
+                [1, x_kernel_size, y_kernel_size, config.micro_size_k],
+            )
+            batch, x, y, k = sch.get_loops(main_block)
+        by, vy, ty, yi = sch.split(
+            y, [None, config.vthread_y, config.block_size_y, config.micro_size_y]
+        )
+        bx, vx, tx, xi = sch.split(
+            x, [None, config.vthread_x, config.block_size_x, config.micro_size_x]
+        )
+        ko, ki = sch.split(k, factors=[None, config.micro_size_k])
+        reordered_loops = [by, bx, vy, vx, ty, tx, ko, ki] + (
+            [yi, xi] if config.inner_x else [xi, yi]
+        )
+        sch.reorder(*reordered_loops)
+        by = sch.fuse(batch, by)
+        sch.bind(bx, "blockIdx.x")
+        sch.bind(by, "blockIdx.y")
+        sch.bind(vy, "vthread.y")
+        sch.bind(vx, "vthread.x")
+        sch.bind(ty, "threadIdx.y")
+        sch.bind(tx, "threadIdx.x")
+        inner_loop = config.micro_size_x if config.inner_x else config.micro_size_y
+        if inner_loop % config.vector_size == 0:
+            _, v = sch.split(reordered_loops[-1], [None, config.vector_size])
+            sch.vectorize(v)
+
+        if config.unroll > 0:
+            sch.annotate(tx, ann_key="pragma_auto_unroll_max_step", ann_val=config.unroll)
+            sch.annotate(tx, ann_key="pragma_unroll_explicit", ann_val=1)
+
+        l2g = sch.cache_write(main_block, 0, "local")
+        sch.reverse_compute_at(l2g, tx, preserve_unit_loops=True)
+        if config.micro_size_x % config.vector_size == 0:
+            _, v = sch.split(sch.get_loops(l2g)[-1], [None, config.vector_size])
+            sch.vectorize(v)
+
+        if config.use_shared:
+
+            def _cooperative_fetch(index, vec_len):
+                block = sch.cache_read(main_block, index, "shared")
+                num_loops = len(sch.get_loops(block))
+                sch.compute_at(block, ko, preserve_unit_loops=True)
+                loops = sch.get_loops(block)[-num_loops:]
+                ty, tx, _, vec = sch.split(
+                    sch.fuse(*loops),
+                    factors=[config.block_size_y, config.block_size_x, None, vec_len],
+                )
+                sch.vectorize(vec)
+                sch.bind(ty, "threadIdx.y")
+                sch.bind(tx, "threadIdx.x")
+                if config.storage_align:
+                    sch.storage_align(block, 0, axis=1, factor=8, offset=vec_len)
+                return block
+
+            a_g2s = _cooperative_fetch(0, vec_len=config.vector_size)
+            b_g2s = _cooperative_fetch(1, vec_len=config.vector_size)
+
+            auto_inline_producers(sch, a_g2s)
+            auto_inline_producers(sch, b_g2s)
+        else:
+            auto_inline_producers(sch, main_block)
+
+        auto_inline_consumer_chain(sch, l2g)
+
+        sch.decompose_reduction(main_block, ko)
+        return sch
+
+```
+
+The 
+>>>>>>> adeb664 (add log_data.cc, matmul1.py and try fash)
