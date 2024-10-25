@@ -29,12 +29,12 @@ from tvm.tir.schedule.schedule import BlockRV
 
 from ..base import analysis, BlockInfo, IterInfo
 from .base import GPUScheduleRule
-
+from tvm.script import tir as T
 import json
 import os
 import subprocess
 
-import math
+from tvm import tir
 
 def is_dynamic_loop(i) -> bool:
     """Check if a given loop has a dynamic shape."""
@@ -71,20 +71,15 @@ def get_tiling_factor(target, sch, i, j, k):
     if is_dynamic_loop(sch.get(k).extent):
         loop_k = True
 
-    # if is_dynamic_loop(sch, i, j, k):
-    #     print(f"dynamic shape in i: {i}, j : {j}, k: {k}")
-    # else:
-    #     print(f"NO Dynamic shape in i: {i}, j : {j}, k: {k}")
-
     best_i_factors = None
     best_j_factors = None
     best_k_factors = None
     best_latency = float('inf')
 
     for _ in range(10):
-        i_factors = sch.sample_perfect_tile(loop = i, n = 2, max_innermost_factor = 8)
-        j_factors = sch.sample_perfect_tile(loop = j, n = 2, max_innermost_factor = 8)
-        k_factors = sch.sample_perfect_tile(loop = k, n = 2, max_innermost_factor = 8)
+        i_factors = sch.sample_perfect_tile(loop = i, n = 2)
+        j_factors = sch.sample_perfect_tile(loop = j, n = 2)
+        k_factors = sch.sample_perfect_tile(loop = k, n = 2)
 
     trace = sch.trace
     decisions = trace.decisions  # Access the decisions dictionary
@@ -111,11 +106,10 @@ def get_tiling_factor(target, sch, i, j, k):
     print(f"type j: {type(j_true)}, j: {j_true} possible_j_factors: {possible_j_factors}")
     print(f"type k: {type(k_true)}, i: {k_true} possible_k_factors: {possible_k_factors}")
     print("-------------------")            
-    #target.Target.current(allow_none=False)
-
+   
     memory_shared_size, l2_cache_size = target_memory_size(target)
 
-    pre_defined_factor = [[256,4]]
+    pre_defined_factor = [[64,16]]
     if loop_i:
         possible_i_factors = pre_defined_factor
         i_true = 1024
@@ -126,45 +120,14 @@ def get_tiling_factor(target, sch, i, j, k):
         possible_k_factors = pre_defined_factor
         k_true = 1024
 
-    #pre_defined_factor = [[1, 1], [2, 2], [4, 4], [8, 4], [8, 8]]
-    
-    # #reset possible tiling factors for negative tiling
-    # if has_negative_values(possible_i_factors):
-    #     print("negative in i")
-    #     possible_i_factors.clear()
-    #     possible_i_factors = pre_defined_factor
-        
-    # if has_negative_values(possible_j_factors):
-    #     print("negative in j")
-    #     possible_j_factors.clear()
-    #     possible_j_factors = pre_defined_factor
-        
-    # if has_negative_values(possible_k_factors):
-    #     print("negative in k")
-    #     possible_k_factors.clear()
-    #     possible_k_factors = pre_defined_factor
-        
-    # print(type(possible_i_factors))
-    # print(type(possible_j_factors))
-    # print(type(possible_k_factors))
-    latency = float('inf')
     for tile_i in possible_i_factors:
         for tile_j in possible_j_factors:
             for tile_k in possible_k_factors:
-                print(f"tile i {tile_i}, tile_j {tile_j}, tile_k {tile_k}, i_true {int(i_true)}, j_true, {int(j_true)}, k_true {int(k_true)}")
-                if tile_k[1]<=8:
-                    if tile_j[1] <=8:
-                        if tile_i[1] <= 4:
-                            latency = run_ace(str(int(i_true)), str(int(j_true)), str(int(k_true)), str(tile_i[0]), str(tile_j[0]), str(tile_k[0]))
-                    elif tile_j[1] <=4:
-                        if tile_i[1] <=8:
-                            latency = run_ace(str(int(i_true)), str(int(j_true)), str(int(k_true)), str(tile_i[0]), str(tile_j[0]), str(tile_k[0]))
-
-                    #print(f"tiling factors: {tile_i, tile_j, tile_k}")
-                    #run ace
+                if tile_i[0] * tile_k[0] + tile_k[0] * tile_j[0] + tile_i[0] * tile_j[0] <= memory_shared_size:
                     
-                    #latency = run_ace(str(int(i_true)), str(int(j_true)), str(int(k_true)), str(tile_i[0]), str(tile_j[0]), str(tile_k[0]))
-                    if latency is not None and not math.isinf(latency):
+                    print(f"tile i {tile_i}, tile_j {tile_j}, tile_k {tile_k}, i_true {i_true}, j_true, {j_true}, k_true {k_true}")
+                    latency = run_ace(str(int(i_true)), str(int(j_true)), str(int(k_true)), str(tile_i[0]), str(tile_j[0]), str(tile_k[0]))
+                    if latency is not None:
                         print(latency)
                         if latency < best_latency:
                             best_i_factors = tile_i
@@ -183,7 +146,7 @@ def get_tiling_factor(target, sch, i, j, k):
     if best_i_factors is None or best_j_factors is None or best_k_factors is None:
         best_i_factors = [None, 8]
         best_j_factors = [None, 8]
-        best_k_factors = [None, 4]
+        best_k_factors = [None, 16]
 
     return [None, best_i_factors[1]], [None, best_j_factors[1]], [None, best_k_factors[1]]
 
@@ -579,6 +542,7 @@ class MetalMatmul(GPUScheduleRule):
         self,
         func: tir.PrimFunc,
         target: Target,
+        func_name: str,
         _: bool,
     ) -> Optional[tir.Schedule]:
         from tvm.tir.tensor_intrin.metal import (  # pylint: disable=import-outside-toplevel
@@ -720,6 +684,7 @@ class MatmulTensorization(GPUScheduleRule):
         self,
         func: tir.PrimFunc,
         target: Target,
+        func_name: str,
         _: bool,
     ) -> Optional[tir.Schedule]:
         from tvm.tir.tensor_intrin.cuda import (  # pylint: disable=import-outside-toplevel
@@ -773,17 +738,12 @@ class MatmulTensorization(GPUScheduleRule):
 
         batch_0, i_0, j_0, k_0 = sch.get_loops(main_block)
         print(f"batch0 {sch.get(batch_0).extent}, i0 {sch.get(i_0).extent}, j0 {sch.get(j_0).extent}, k0 {sch.get(k_0).extent}")
-        get_tiling_factor(target, sch, i_0, j_0, k_0)
-        #i_factors, j_factors, k_factors = 
-        # i_factors, j_factors, k_factors = (
-        #     [None, 1, 4, 2],
-        #     [1, None, 4, 2],
-        #     [None, 4],
-        # )
+        #i_factors, j_factors, k_factors = get_tiling_factor(target, sch, i_0, j_0, k_0)
+
         i_factors, j_factors, k_factors = (
-            [None, 8],
             [None, 4],
-            [None, 8],
+            [None, 4],
+            [None, 4],
          )
 
         num_ty = int(i_factors[1])
@@ -831,6 +791,14 @@ class MatmulTensorization(GPUScheduleRule):
 
         sch.reorder(i0, j0, k0, i1, j1, k1)
 
+        i_extent = sch.get(i0).extent
+        j_extent = sch.get(j0).extent
+        k_extent = sch.get(k0).extent
+
+        # Assuming `i_factors`, `j_factors`, and `k_factors` are lists
+        i_factor = i_factors[1]
+        j_factor = j_factors[1]
+        k_factor = k_factors[1]
         #block_idx = sch.fuse(i0, j0) #fused to mimic algorithm
         #block_idy = sch.fuse(i1, j1) # fused to mimic
         #thread_idy = sch.fuse(j2, i2)
@@ -945,8 +913,75 @@ class MatmulTensorization(GPUScheduleRule):
         sch.bind(f1, "threadIdx.x")
         sch.vectorize(f2)
 
+        # print(sch.mod)
+        # func = sch.mod[func_name]
+        # eval = tir.Evaluate(tir.call_extern(
+        #         "void",  # Return type
+        #         "log_loop_indices",  # External logging function
+        #         "linear0", 1, 4, 4, 4, 4, 4  # Function name and dimensions
+        #     ))
+        
+        # combine = tir.SeqStmt([eval, func.body])
+        # print(combine)
+        # sch.mod.update_func(func, func)
+        # print("__________________fdj+_____________")
+        # print(sch.mod)
+        #print(f"module of sch {sch.mod}")
+        sch = apply_logging(sch, func_name, i_extent, j_extent, k_extent, i_factor, j_factor, k_factor)
+        #print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        #print(f"modified {sch.mod}")
         return sch if tensorize_success else None
 
+def inject_logging_into_body(func: tir.PrimFunc, func_name: str, i_extent, j_extent, k_extent, i_factor, j_factor, k_factor) -> tir.PrimFunc:
+    """
+    Inject logging directly into the function's body
+    """
+    # Create the TIR Evaluate node for logging
+    eval_stmt = tir.Evaluate(
+        tir.call_extern(
+            "void",  # External function return type
+            "log_loop_indices",  # Name of the external logging function
+            func_name, i_extent, j_extent, k_extent, i_factor, j_factor, k_factor  # Function name and dimensions to log
+        )
+    )
+
+    # Create a new body with the logging statement followed by the original body
+    new_body = tir.SeqStmt([eval_stmt, func.body])
+
+    block = tir.Block(
+        iter_vars=[],
+        reads=[],
+        writes=[],
+        name_hint="root",
+        body=new_body,
+    )
+    block_realize = tir.BlockRealize(
+        iter_values=[], predicate=True, block=block
+    )
+
+    # Create and return the new PrimFunc with the modified body
+    return func.with_body(block_realize)
+
+def apply_logging(sch: tir.Schedule, func_name: str, i_extent, j_extent, k_extent, i_factor, j_factor, k_factor) -> tir.Schedule:
+    """
+    Retrieve the function from the schedule, modify its body, and return the updated schedule.
+    """
+    # Retrieve the function from the schedule's IRModule
+    func = sch.mod["main"]
+    #print(f"Original Function:\n{func}")
+
+    # Inject the logging statement into the function body
+    modified_func = inject_logging_into_body(func, func_name, i_extent, j_extent, k_extent, i_factor, j_factor, k_factor)
+
+    # Update the module with the modified function
+    gv = sch.mod.get_global_var("main")
+    sch.mod[gv] = modified_func  # Update the function in the IRModule
+
+    
+    #print(f"Modified Function:\n{sch.mod['main']}")
+
+    # Return the updated schedule
+    return sch
 
 class MatmulInt8Tensorization(GPUScheduleRule):
     """
@@ -958,6 +993,7 @@ class MatmulInt8Tensorization(GPUScheduleRule):
         self,
         func: tir.PrimFunc,
         target: Target,
+        func_name: str,
         _: bool,
     ) -> Optional[tir.Schedule]:
         from tvm.tir.tensor_intrin.cuda import (  # pylint: disable=import-outside-toplevel
@@ -1151,7 +1187,7 @@ class MatmulInt8Tensorization(GPUScheduleRule):
         _, f1, f2 = sch.split(fused, factors=[None, warp_size, vector_size])
         sch.bind(f1, "threadIdx.x")
         sch.vectorize(f2)
-
+        
         return sch
 
 
@@ -1214,6 +1250,7 @@ class Matmul(GPUScheduleRule):
         self,
         func: tir.PrimFunc,
         target: Target,
+        func_name: str,
         _: bool,
     ) -> Optional[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
@@ -1283,14 +1320,14 @@ class Matmul(GPUScheduleRule):
                 in_dtype, out_dtype = get_in_out_dtypes(block_stmt)
                 tensorize_sch = None
                 if in_dtype == "int8" and out_dtype == "int32":
-                    tensorize_sch = MatmulInt8Tensorization().apply(func, target, _)
+                    tensorize_sch = MatmulInt8Tensorization().apply(func, target, func_name, _)
                 elif in_dtype == "float16" and out_dtype in ["float16", "float32"]:
-                    tensorize_sch = MatmulTensorization().apply(func, target, _)
+                    tensorize_sch = MatmulTensorization().apply(func, target, func_name, _)
                 if tensorize_sch is not None:
                     return tensorize_sch
         elif target.kind.name == "metal":
             try:
-                return MetalMatmul().apply(func, target, _)
+                return MetalMatmul().apply(func, target, func_name, _)
             except:  # pylint: disable=bare-except
                 pass
 
